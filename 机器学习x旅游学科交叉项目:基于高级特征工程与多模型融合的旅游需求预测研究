@@ -1,0 +1,342 @@
+"""
+项目：基于高级特征工程与多模型融合的旅游需求预测研究
+环境要求：Python 3.7+，需安装以下库：
+    pip install numpy pandas matplotlib seaborn scikit-learn xgboost lightgbm shap optuna imbalanced-learn
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+import xgboost as xgb
+import lightgbm as lgb
+import shap
+import optuna
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== 1. 输入数据 ====================
+print("正在将文本转为数据...")
+np.random.seed(42)
+date_rng = pd.date_range(start='2020-01-01', end='2024-12-31', freq='D')
+n = len(date_rng)
+
+# 游客量生成
+trend = 100 * (1 + 0.05) ** (np.arange(n) / 365)
+seasonal_year = 50 * np.sin(2 * np.pi * (date_rng.dayofyear / 365 - 0.2))
+weekly = 15 * (date_rng.dayofweek >= 5).astype(int)
+noise = np.random.normal(0, 8, n)
+visitors = trend + seasonal_year + weekly + noise
+
+# 节假日效应
+spring_festivals = pd.to_datetime(['2020-01-25', '2021-02-12', '2022-02-01', '2023-01-22', '2024-02-10'])
+national_days = pd.to_datetime(['2020-10-01', '2021-10-01', '2022-10-01', '2023-10-01', '2024-10-01'])
+holidays = np.concatenate([spring_festivals, national_days])
+holiday_effect = np.zeros(n)
+for h in holidays:
+    idx = date_rng.get_indexer([h], method='nearest')[0]
+    for offset in range(-3, 4):
+        if 0 <= idx + offset < n:
+            effect = 40 * (1 - abs(offset) / 4)
+            holiday_effect[idx + offset] += effect
+visitors += holiday_effect
+visitors = np.maximum(visitors, 20)
+
+# 天气数据
+temp_base = 20 + 15 * np.sin(2 * np.pi * (date_rng.dayofyear / 365 - 0.3))
+temperature = temp_base + np.random.normal(0, 3, n)
+precip_base = 3 + 3 * np.sin(2 * np.pi * (date_rng.dayofyear / 365 - 0.5))
+precip_base = np.maximum(precip_base, 0.5)
+precipitation = np.random.exponential(precip_base)
+humidity = 60 + 10 * np.sin(2 * np.pi * (date_rng.dayofyear / 365 - 0.2)) + 0.5 * precipitation + np.random.normal(0, 5, n)
+humidity = np.clip(humidity, 30, 95)
+
+# 社交媒体热度
+social_media = 200 + 0.8 * visitors + np.random.normal(0, 20, n)
+social_media = np.maximum(social_media, 50)
+
+# 经济指标
+gdp_base = 0.05 + 0.005 * np.sin(2 * np.pi * (date_rng.dayofyear / 365))
+gdp_growth = gdp_base + np.random.normal(0, 0.005, n)
+gdp_growth = np.clip(gdp_growth, 0.02, 0.08)
+
+# 组装DataFrame
+df = pd.DataFrame({
+    'date': date_rng,
+    'visitors': np.round(visitors, 0).astype(int),
+    'temperature': np.round(temperature, 1),
+    'precipitation': np.round(precipitation, 1),
+    'humidity': np.round(humidity, 1),
+    'social_media': np.round(social_media, 0).astype(int),
+    'gdp_growth': np.round(gdp_growth, 3)
+})
+df['holiday'] = (holiday_effect > 0).astype(int)
+print("数据生成完成，形状:", df.shape)
+
+# ==================== 2. 数据预处理 ====================
+print("\n数据预处理...")
+# 提取日期特征
+df['year'] = df['date'].dt.year
+df['month'] = df['date'].dt.month
+df['day'] = df['date'].dt.day
+df['dayofweek'] = df['date'].dt.dayofweek
+df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
+df['dayofyear'] = df['date'].dt.dayofyear
+
+# ==================== 3. 高级特征工程 ====================
+print("高级特征工程...")
+# 天气舒适度指数
+df['comfort_index'] = (10 - np.abs(df['temperature'] - 20) 
+                       - 0.1 * np.abs(df['humidity'] - 50) 
+                       - df['precipitation'] / 5)
+df['comfort_index'] = df['comfort_index'].clip(0, 10)
+
+# 滞后特征
+for lag in [1, 2, 3, 7, 14, 30]:
+    df[f'visitors_lag{lag}'] = df['visitors'].shift(lag)
+
+# 滚动统计
+for window in [3, 7, 14]:
+    df[f'visitors_rolling{window}_mean'] = df['visitors'].rolling(window).mean()
+    df[f'visitors_rolling{window}_std'] = df['visitors'].rolling(window).std()
+
+# 社交媒体滞后与滚动
+df['social_media_lag7'] = df['social_media'].shift(7)
+df['social_media_rolling7_mean'] = df['social_media'].rolling(7).mean()
+
+# 经济指标滞后
+df['gdp_growth_lag1'] = df['gdp_growth'].shift(1)
+
+# 删除NaN
+df.dropna(inplace=True)
+df.reset_index(drop=True, inplace=True)
+print(f"特征工程后数据形状: {df.shape}")
+
+# ==================== 4. 划分训练/测试集 ====================
+print("\n划分训练集和测试集...")
+train_df = df[df['date'] < '2024-01-01'].copy()
+test_df = df[df['date'] >= '2024-01-01'].copy()
+
+# 基于训练集定义高峰日阈值
+threshold = train_df['visitors'].quantile(0.8)
+train_df['peak'] = (train_df['visitors'] >= threshold).astype(int)
+test_df['peak'] = (test_df['visitors'] >= threshold).astype(int)
+print(f"高峰日阈值: {threshold:.0f}, 训练集高峰比例: {train_df['peak'].mean():.2%}, 测试集高峰比例: {test_df['peak'].mean():.2%}")
+
+# 特征列
+feature_cols = ['month', 'dayofweek', 'is_weekend', 'holiday',
+                'temperature', 'precipitation', 'humidity', 'comfort_index',
+                'social_media', 'social_media_lag7', 'social_media_rolling7_mean',
+                'gdp_growth', 'gdp_growth_lag1',
+                'visitors_lag1', 'visitors_lag2', 'visitors_lag3',
+                'visitors_lag7', 'visitors_lag14', 'visitors_lag30',
+                'visitors_rolling3_mean', 'visitors_rolling3_std',
+                'visitors_rolling7_mean', 'visitors_rolling7_std',
+                'visitors_rolling14_mean', 'visitors_rolling14_std']
+
+X_train = train_df[feature_cols]
+y_train = train_df['peak']
+X_test = test_df[feature_cols]
+y_test = test_df['peak']
+
+print(f"训练集样本数: {len(X_train)}, 测试集样本数: {len(X_test)}")
+
+# 时间序列交叉验证
+tscv = TimeSeriesSplit(n_splits=5)
+
+# ==================== 5. 贝叶斯优化调参 ====================
+print("\n开始贝叶斯优化调参...")
+
+def objective(trial, model_name, X, y, cv):
+    if model_name == 'xgb':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10, log=True)
+        }
+        model = xgb.XGBClassifier(**params, random_state=42, use_label_encoder=False, eval_metric='logloss')
+    elif model_name == 'lgb':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10, log=True)
+        }
+        model = lgb.LGBMClassifier(**params, random_state=42, verbose=-1)
+    elif model_name == 'rf':
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 20),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5)
+        }
+        model = RandomForestClassifier(**params, random_state=42)
+    else:
+        raise ValueError("Unknown model")
+    
+    f1_scores = []
+    for train_idx, val_idx in cv.split(X):
+        X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
+        y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+        
+        smote = SMOTE(random_state=42)
+        X_train_res, y_train_res = smote.fit_resample(X_train_fold, y_train_fold)
+        
+        model.fit(X_train_res, y_train_res)
+        y_pred = model.predict(X_val_fold)
+        f1_scores.append(f1_score(y_val_fold, y_pred))
+    
+    return np.mean(f1_scores)
+
+# XGBoost
+study_xgb = optuna.create_study(direction='maximize')
+study_xgb.optimize(lambda trial: objective(trial, 'xgb', X_train, y_train, tscv), n_trials=20, show_progress_bar=True)
+
+# LightGBM
+study_lgb = optuna.create_study(direction='maximize')
+study_lgb.optimize(lambda trial: objective(trial, 'lgb', X_train, y_train, tscv), n_trials=20, show_progress_bar=True)
+
+# Random Forest
+study_rf = optuna.create_study(direction='maximize')
+study_rf.optimize(lambda trial: objective(trial, 'rf', X_train, y_train, tscv), n_trials=15, show_progress_bar=True)
+
+best_xgb_params = study_xgb.best_params
+best_lgb_params = study_lgb.best_params
+best_rf_params = study_rf.best_params
+
+print("\n最佳XGBoost参数:", best_xgb_params)
+print("最佳LightGBM参数:", best_lgb_params)
+print("最佳Random Forest参数:", best_rf_params)
+
+# ==================== 6. 训练模型并搜索最佳阈值 ====================
+print("\n训练模型并搜索最佳阈值...")
+
+def train_with_threshold(model, X_train, y_train, X_val, y_val):
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_train, y_train)
+    model.fit(X_res, y_res)
+    y_proba = model.predict_proba(X_val)[:, 1]
+    
+    thresholds = np.arange(0.3, 0.7, 0.01)
+    best_f1 = 0
+    best_thresh = 0.5
+    for thresh in thresholds:
+        y_pred = (y_proba >= thresh).astype(int)
+        f1 = f1_score(y_val, y_pred)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = thresh
+    return model, best_thresh, best_f1
+
+# 使用最后一次交叉验证划分作为验证集
+train_idx, val_idx = list(tscv.split(X_train))[-1]
+X_train_final, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+y_train_final, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+# XGBoost
+xgb_model = xgb.XGBClassifier(**best_xgb_params, random_state=42, use_label_encoder=False, eval_metric='logloss')
+xgb_model, xgb_thresh, xgb_f1 = train_with_threshold(xgb_model, X_train_final, y_train_final, X_val, y_val)
+
+# LightGBM
+lgb_model = lgb.LGBMClassifier(**best_lgb_params, random_state=42, verbose=-1)
+lgb_model, lgb_thresh, lgb_f1 = train_with_threshold(lgb_model, X_train_final, y_train_final, X_val, y_val)
+
+# Random Forest
+rf_model = RandomForestClassifier(**best_rf_params, random_state=42)
+rf_model, rf_thresh, rf_f1 = train_with_threshold(rf_model, X_train_final, y_train_final, X_val, y_val)
+
+print(f"验证集F1 - XGBoost: {xgb_f1:.4f} (阈值={xgb_thresh:.2f})")
+print(f"验证集F1 - LightGBM: {lgb_f1:.4f} (阈值={lgb_thresh:.2f})")
+print(f"验证集F1 - Random Forest: {rf_f1:.4f} (阈值={rf_thresh:.2f})")
+
+# ==================== 7. 测试集评估 ====================
+print("\n测试集评估...")
+y_pred_xgb = (xgb_model.predict_proba(X_test)[:, 1] >= xgb_thresh).astype(int)
+f1_xgb_test = f1_score(y_test, y_pred_xgb)
+y_pred_lgb = (lgb_model.predict_proba(X_test)[:, 1] >= lgb_thresh).astype(int)
+f1_lgb_test = f1_score(y_test, y_pred_lgb)
+y_pred_rf = (rf_model.predict_proba(X_test)[:, 1] >= rf_thresh).astype(int)
+f1_rf_test = f1_score(y_test, y_pred_rf)
+
+print(f"测试集F1 - XGBoost: {f1_xgb_test:.4f}")
+print(f"测试集F1 - LightGBM: {f1_lgb_test:.4f}")
+print(f"测试集F1 - Random Forest: {f1_rf_test:.4f}")
+
+# ==================== 8. 模型融合 ====================
+print("\n模型融合...")
+# 加权融合
+weights = {'xgb': xgb_f1, 'lgb': lgb_f1, 'rf': rf_f1}
+total = sum(weights.values())
+weights = {k: v/total for k, v in weights.items()}
+
+# 获取各模型在测试集上的概率
+proba_xgb = xgb_model.predict_proba(X_test)[:, 1]
+proba_lgb = lgb_model.predict_proba(X_test)[:, 1]
+proba_rf = rf_model.predict_proba(X_test)[:, 1]
+
+# 加权概率
+weighted_proba = (weights['xgb'] * proba_xgb + 
+                  weights['lgb'] * proba_lgb + 
+                  weights['rf'] * proba_rf)
+# 设置阈值
+y_pred_weighted = (weighted_proba >= 0.55).astype(int)
+f1_weighted = f1_score(y_test, y_pred_weighted)
+print(f"加权融合测试集F1: {f1_weighted:.4f}")
+
+# Stacking融合
+X_train_meta = np.column_stack([
+    xgb_model.predict_proba(X_train)[:, 1],
+    lgb_model.predict_proba(X_train)[:, 1],
+    rf_model.predict_proba(X_train)[:, 1]
+])
+meta_model = LogisticRegression(random_state=42)
+meta_model.fit(X_train_meta, y_train)
+
+X_test_meta = np.column_stack([
+    proba_xgb, proba_lgb, proba_rf
+])
+y_pred_stacking = meta_model.predict(X_test_meta)
+f1_stacking = f1_score(y_test, y_pred_stacking)
+print(f"Stacking融合测试集F1: {f1_stacking:.4f}")
+
+# ==================== 9. 可解释性分析（SHAP）====================
+print("\nSHAP可解释性分析...")
+# 选择表现最好的单模型（此处假设XGBoost）
+best_model = xgb_model
+explainer = shap.TreeExplainer(best_model)
+# 取部分训练样本进行解释
+sample_size = min(200, len(X_train))
+X_sample = X_train.sample(sample_size, random_state=42)
+shap_values = explainer.shap_values(X_sample)
+
+# 条形图
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_sample, plot_type="bar", feature_names=feature_cols, max_display=10, show=False)
+plt.tight_layout()
+plt.savefig('shap_bar.png', dpi=300)
+print("SHAP条形图已保存为 shap_bar.png")
+
+# 蜂群图
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values, X_sample, feature_names=feature_cols, max_display=10, show=False)
+plt.tight_layout()
+plt.savefig('shap_beeswarm.png', dpi=300)
+print("SHAP蜂群图已保存为 shap_beeswarm.png")
+
+# ==================== 10. 最终结果输出 ====================
+print("\n========== 最终结果 ==========")
+print(f"\n测试集最佳单模型F1: {max(f1_xgb_test, f1_lgb_test, f1_rf_test):.4f}")
+print(f"加权融合F1: {f1_weighted:.4f} (较单模型提升 {((f1_weighted - max(f1_xgb_test, f1_lgb_test, f1_rf_test))/max(f1_xgb_test, f1_lgb_test, f1_rf_test)*100):.1f}%)")
+print(f"Stacking融合F1: {f1_stacking:.4f} (较单模型提升 {((f1_stacking - max(f1_xgb_test, f1_lgb_test, f1_rf_test))/max(f1_xgb_test, f1_lgb_test, f1_rf_test)*100):.1f}%)")
